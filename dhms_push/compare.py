@@ -257,7 +257,8 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
         dup = int(k.duplicated(keep=False).sum())
         if dup:
             issue("BLOCKER", ", ".join(keys), f"duplicate {kind} values inside the silver file", dup,
-                  k[k.duplicated(keep=False)].head(MAX_EXAMPLES).astype(str).agg("|".join, axis=1).tolist())
+                  ["|".join("" if v is None or (isinstance(v, float) and v != v) else str(v) for v in row)
+                   for row in k[k.duplicated(keep=False)].head(MAX_EXAMPLES).itertuples(index=False)])
 
     if t.primary_key is not None and not t.primary_key:
         issue("INFO", "", "table has no primary key: re-pushing the same UPC would add duplicate rows")
