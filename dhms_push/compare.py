@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from . import config
-from .schema import TableDef
+from .schema import TableDef, constant_default, has_db_default
 
 INT_RANGES = {"smallint": 2**15 - 1, "integer": 2**31 - 1, "bigint": 2**63 - 1}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
@@ -186,9 +186,13 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
             issue("BLOCKER", name, "GENERATED ALWAYS AS IDENTITY: an explicit value is rejected "
                                    "(drop the column from the push or use OVERRIDING SYSTEM VALUE)", n)
         if not c["nullable"] and row["silver_nulls"]:
-            problems.append(f"{row['silver_nulls']} NULL in NOT NULL column")
-            issue("BLOCKER", name, "NULL values in a NOT NULL column (a default is NOT used for an explicit NULL)",
-                  row["silver_nulls"])
+            if has_db_default(c):
+                what = "identity" if c["default"] is None else f"default {c['default']}"
+                problems.append(f"{row['silver_nulls']} NULL → database {what}")
+                issue("WARNING", name, f"NULL in silver → the database {what} is written", row["silver_nulls"])
+            else:
+                problems.append(f"{row['silver_nulls']} NULL in NOT NULL column")
+                issue("BLOCKER", name, "NULL values in a NOT NULL column without a default", row["silver_nulls"])
         if _not_checked(c):
             row["type_check"] = f"not checked ({c['type']})"
             issue("INFO", name, f"values not checked against type {c['type']}")
@@ -242,7 +246,12 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
         issue("WARNING", ", ".join(extra), "silver columns not in the database table (dropped on push)", len(extra))
 
     # keys inside the silver file
-    for kind, keys in [("primary key", t.primary_key)] + [(f"unique {u['name']}", u["columns"]) for u in t.uniques]:
+    # NULL rules follow Postgres: a key with a NULL part never equals another key, unless NULLS NOT DISTINCT.
+    # Primary key: NULLs are reported by the NOT NULL check above (BLOCKER, or WARNING when the database
+    # default fills them), so they are left out here too.
+    for kind, keys, nnd in ([("primary key", t.primary_key, False)] +
+                            [(f"unique {u['name']}", u["columns"], u.get("nulls_not_distinct", False))
+                             for u in t.uniques]):
         if not keys:
             continue
         missing = [k for k in keys if k not in df.columns]
@@ -254,6 +263,14 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
                   f"{kind} column(s) {missing} not in silver")
             continue
         k = df[keys].map(_key) if hasattr(df, "map") else df[keys].applymap(_key)
+        if not nnd:
+            null_part = (df[keys].map(_is_null) if hasattr(df, "map") else df[keys].applymap(_is_null)).any(axis=1)
+            if kind == "primary key":
+                fixed = [c for c in keys if constant_default(t.column(c)) and df[c].map(_is_null).sum() > 1]
+                if fixed:
+                    issue("WARNING", ", ".join(keys), f"NULL primary key values filled by a constant default "
+                          f"({', '.join(fixed)}): those rows may collide", int(null_part.sum()))
+            k = k[~null_part]
         dup = int(k.duplicated(keep=False).sum())
         if dup:
             issue("BLOCKER", ", ".join(keys), f"duplicate {kind} values inside the silver file", dup,

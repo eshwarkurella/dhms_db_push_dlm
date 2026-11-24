@@ -11,10 +11,11 @@ from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
+from psycopg2.extensions import AsIs
 from psycopg2.extras import Json
 
 from . import config
-from .schema import TableDef
+from .schema import TableDef, has_db_default
 
 _INT = ("smallint", "integer", "bigint")
 _FLOAT = ("numeric", "decimal", "real", "double precision")
@@ -109,5 +110,11 @@ def insert_columns(t: TableDef, df: pd.DataFrame) -> list:
 def rows_for_insert(t: TableDef, df: pd.DataFrame) -> tuple[list, list]:
     cols = insert_columns(t, df)
     defs = [t.column(c) for c in cols]
-    data = [tuple(convert(v, d) for v, d in zip(rec, defs)) for rec in df[cols].itertuples(index=False, name=None)]
+    # NULL in a NOT NULL column the database can fill (default / identity BY DEFAULT) → DEFAULT
+    # (an explicit NULL would be rejected)
+    use_default = [(not d["nullable"]) and has_db_default(d) for d in defs]
+    default = AsIs("DEFAULT")
+    data = [tuple(default if (u and x is None) else x
+                  for x, u in zip((convert(v, d) for v, d in zip(rec, defs)), use_default))
+            for rec in df[cols].itertuples(index=False, name=None)]
     return cols, data
