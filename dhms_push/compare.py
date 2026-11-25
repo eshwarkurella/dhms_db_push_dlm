@@ -194,31 +194,44 @@ def check_violations(conn: Connection, t: TableDef, chk: dict, df: pd.DataFrame)
 
 
 def missing_parents(conn: Connection, t: TableDef, fk: dict, df: pd.DataFrame, pending: dict, mode: str):
-    """Values of a one-column foreign key in df that the parent will NOT hold at insert time.
+    """Keys of a foreign key (one or more columns) in df that the parent will NOT hold at insert time.
     The parent at insert time = its database rows (minus this survey's rows that replace deletes, when the
     parent is part of this push) + its silver rows when it is pushed before this table (pending).
-    Returns (missing values sorted, number of df rows holding one, description of where it was looked up)."""
-    col, ref = fk["columns"][0], fk["ref_columns"][0]
-    vals = sorted({_key(v) for v in df[col] if not _is_null(v)}, key=str)
+    A row with a NULL in any key column is not checked (Postgres MATCH SIMPLE).
+    Returns (missing keys sorted — the value for one column, 'a | b' for several —, number of df rows holding
+    one, description of where it was looked up)."""
+    cols, refs = fk["columns"], fk["ref_columns"]
+
+    def keys(frame, cs):
+        return [None if any(_is_null(v) for v in row) else tuple(str(_key(v)) for v in row)
+                for row in frame[cs].itertuples(index=False, name=None)]
+
+    df_keys = keys(df, cols)
+    vals = sorted({k for k in df_keys if k is not None})
     parent = (pending or {}).get(fk["ref_table"]) if fk["ref_schema"] == t.schema else None
     drop, drop_params = "", {}
     if parent is not None and mode == "replace" and parent[1] is not None:
         drop, drop_params = f" AND NOT ({parent[1][0]})", parent[1][1]
     found = set()
-    if parent is not None and ref in parent[0].columns:
-        found |= {str(_key(v)) for v in parent[0][ref] if not _is_null(v)}
+    if parent is not None and all(r in parent[0].columns for r in refs):
+        found |= {k for k in keys(parent[0], refs) if k is not None}
+    sel = ", ".join(f'"{r}"' for r in refs)
+    tup = ", ".join(f'"{r}"::text' for r in refs)
+    arrs = ", ".join(f"CAST(:v{i} AS text[])" for i in range(len(refs)))
+    sql = (f'SELECT DISTINCT {sel} FROM "{fk["ref_schema"]}"."{fk["ref_table"]}" '
+           f"WHERE ({tup}) IN (SELECT * FROM unnest({arrs})){drop}")
     for i in range(0, len(vals), KEY_CHUNK):
         part = vals[i:i + KEY_CHUNK]
-        found |= {str(_key(r[0])) for r in conn.execute(text(
-            f'SELECT DISTINCT "{ref}" FROM "{fk["ref_schema"]}"."{fk["ref_table"]}" '
-            f'WHERE "{ref}"::text = ANY(:v){drop}'), {**drop_params, "v": [str(x) for x in part]})}
-    miss = [v for v in vals if str(v) not in found]
-    miss_s = {str(v) for v in miss}
-    rows = int(df[col].map(lambda v: not _is_null(v) and str(_key(v)) in miss_s).sum()) if miss else 0
-    where = (f"{fk['ref_table']}.{ref} (database" +
+        params = {**drop_params, **{f"v{j}": [k[j] for k in part] for j in range(len(refs))}}
+        found |= {tuple(str(_key(v)) for v in r) for r in conn.execute(text(sql), params)}
+    miss = [k for k in vals if k not in found]
+    miss_s = set(miss)
+    rows = sum(1 for k in df_keys if k is not None and k in miss_s)
+    ref_txt = f"{fk['ref_table']}." + (refs[0] if len(refs) == 1 else f"({', '.join(refs)})")
+    where = (f"{ref_txt} (database" +
              (", after replace deletes this survey's rows" if drop else "") +
              (", nor in its silver file pushed before this table)" if parent is not None else ")"))
-    return miss, rows, where
+    return [k[0] if len(k) == 1 else " | ".join(k) for k in miss], rows, where
 
 
 def blank_missing_parents(conn: Connection, t: TableDef, df: pd.DataFrame, column: str, pending: dict,
@@ -405,11 +418,9 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
 
     # foreign keys: silver values that the referenced table does not have
     for fk in t.foreign_keys:
-        if len(fk["columns"]) != 1 or fk["columns"][0] not in df.columns:
-            if all(c in df.columns for c in fk["columns"]):
-                issue("INFO", ", ".join(fk["columns"]), f"multi-column foreign key {fk['name']} not checked")
+        if not all(c in df.columns for c in fk["columns"]):
             continue
-        col, ref = fk["columns"][0], fk["ref_columns"][0]
+        col = ", ".join(fk["columns"])
         miss, rows, where = missing_parents(conn, t, fk, df, pending, mode)
         if miss:
             issue("BLOCKER", col, f"foreign key {fk['name']}: value not in {where}", rows, miss[:MAX_EXAMPLES])
