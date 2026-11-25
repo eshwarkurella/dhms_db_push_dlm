@@ -136,11 +136,15 @@ def _key(v):
 
 
 def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_checks: bool = True,
-            scope=None, mode: str = "replace"):
+            scope=None, mode: str = "replace", pending=None):
     """Returns (column rows, issue rows). Issue severity: BLOCKER = the insert would fail;
     WARNING = it would insert but the data would not be what you expect; INFO = for information.
     scope = (SQL condition, params) selecting this survey's rows in the table (see survey.scope_sql);
-    mode 'replace' deletes those rows before the insert, 'append' keeps them."""
+    mode 'replace' deletes those rows before the insert, 'append' keeps them.
+    pending = {table: (silver frame, scope)} of the tables this push inserts BEFORE this one, so a foreign
+    key is checked against what the parent will hold at insert time: its rows in the database (minus the
+    survey's rows that replace deletes) plus its silver rows."""
+    pending = pending or {}
     cols, issues = [], []
 
     def issue(sev, column, what, n=None, examples=None):
@@ -292,17 +296,27 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
             continue
         col, ref = fk["columns"][0], fk["ref_columns"][0]
         vals = sorted({_key(v) for v in df[col] if not _is_null(v)}, key=str)
+        # the parent as it will be at insert time: database rows (minus what replace deletes) + its silver rows
+        parent = pending.get(fk["ref_table"]) if fk["ref_schema"] == t.schema else None
+        drop, drop_params = "", {}
+        if parent is not None and mode == "replace" and parent[1] is not None:
+            drop, drop_params = f" AND NOT ({parent[1][0]})", parent[1][1]
         found = set()
+        if parent is not None and ref in parent[0].columns:
+            found |= {str(_key(v)) for v in parent[0][ref] if not _is_null(v)}
         for i in range(0, len(vals), KEY_CHUNK):
             part = vals[i:i + KEY_CHUNK]
-            found |= {_key(r[0]) for r in conn.execute(text(
-                f'SELECT DISTINCT "{ref}" FROM "{fk["ref_schema"]}"."{fk["ref_table"]}" WHERE "{ref}"::text = ANY(:v)'),
-                {"v": [str(x) for x in part]})}
-        miss = [v for v in vals if v not in found and str(v) not in {str(f) for f in found}]
+            found |= {str(_key(r[0])) for r in conn.execute(text(
+                f'SELECT DISTINCT "{ref}" FROM "{fk["ref_schema"]}"."{fk["ref_table"]}" '
+                f'WHERE "{ref}"::text = ANY(:v){drop}'), {**drop_params, "v": [str(x) for x in part]})}
+        miss = [v for v in vals if str(v) not in found]
         if miss:
-            rows = int(df[col].map(lambda v: not _is_null(v) and (_key(v) in miss or str(_key(v)) in map(str, miss))).sum())
-            issue("BLOCKER", col, f"foreign key {fk['name']}: value not in {fk['ref_table']}.{ref}", rows,
-                  miss[:MAX_EXAMPLES])
+            miss_s = {str(v) for v in miss}
+            rows = int(df[col].map(lambda v: not _is_null(v) and str(_key(v)) in miss_s).sum())
+            where = (f"{fk['ref_table']}.{ref} (database" +
+                     (", after replace deletes this survey's rows" if drop else "") +
+                     (", nor in its silver file pushed before this table)" if parent is not None else ")"))
+            issue("BLOCKER", col, f"foreign key {fk['name']}: value not in {where}", rows, miss[:MAX_EXAMPLES])
 
     # rows of this survey already in the table, and primary keys that would collide
     if scope is None:

@@ -84,6 +84,7 @@ def main() -> int:
         return 2
 
     summary, all_cols, all_issues, defs, prepared = [], [], [], {}, {}
+    pending = {}  # tables already checked = inserted before the next ones (parents first)
     try:
         ids = lookup_ids(conn, db.schema, db.master_table, survey["upc"] or "")
         print(f"Ids     {'found' if ids['found'] else 'NOT FOUND'} via {ids['how']}: "
@@ -108,7 +109,9 @@ def main() -> int:
                 df, filled = apply_ids(table, df, [c["name"] for c in t.columns], ids["ids"])
                 prepared[table] = df
             scope = scope_sql(table, [c["name"] for c in t.columns], survey) if t.exists else None
-            cols, issues = compare(t, df, conn, scope=scope, mode=a.mode)
+            cols, issues = compare(t, df, conn, scope=scope, mode=a.mode, pending=pending)
+            if table in prepared:
+                pending[table] = (prepared[table], scope)
             all_cols += cols
             all_issues += issues
             existing = None
