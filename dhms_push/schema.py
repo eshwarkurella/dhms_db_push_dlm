@@ -19,7 +19,7 @@ class TableDef:
     primary_key: list = field(default_factory=list)
     uniques: list = field(default_factory=list)       # [{name, columns}]
     foreign_keys: list = field(default_factory=list)  # [{name, columns, ref_schema, ref_table, ref_columns, definition}]
-    checks: list = field(default_factory=list)        # [{name, definition}]
+    checks: list = field(default_factory=list)        # [{name, definition, columns}]
     indexes: list = field(default_factory=list)       # [{name, definition}]
     triggers: list = field(default_factory=list)      # [{name, definition}]
     comment: str | None = None
@@ -104,7 +104,7 @@ def read_table_def(conn: Connection, schema: str, table: str) -> TableDef:
                                    "ref_columns": [ref_names.get(k) for k in (r["confkey"] or [])],
                                    "definition": r["def"]})
         elif r["contype"] == "c":
-            t.checks.append({"name": r["conname"], "definition": r["def"]})
+            t.checks.append({"name": r["conname"], "definition": r["def"], "columns": cols})
     t._constraint_defs = [(r["conname"], r["def"]) for r in _q(
         conn, "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = :oid "
               "ORDER BY contype, conname", oid=oid)]

@@ -4,13 +4,17 @@ WARNING = it would insert but not as expected, INFO = for information."""
 import json
 import math
 import re
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+from datetime import date, datetime
+
 from . import config
+from .prepare import convert
 from .schema import TableDef, constant_default, has_db_default
 
 INT_RANGES = {"smallint": 2**15 - 1, "integer": 2**31 - 1, "bigint": 2**63 - 1}
@@ -133,6 +137,60 @@ def _key(v):
     if isinstance(v, (np.integer,)):
         return int(v)
     return v
+
+
+def _as_text(v, d=None):
+    if d is not None:
+        try:
+            v = convert(v, d)
+        except (ValueError, TypeError, OverflowError):
+            pass                               # reported by the type check; the database cast decides
+    if v is None or _is_null(v):
+        return None
+    if isinstance(v, (date, datetime)):
+        return v.isoformat()
+    return str(v)
+
+
+def check_violations(conn: Connection, t: TableDef, chk: dict, df: pd.DataFrame):
+    """Rows of df that break a CHECK constraint, evaluated by the database on the values as they would be
+    inserted. Returns (rows failing, examples) or a str saying why the check was not tested."""
+    cols = chk.get("columns") or []
+    if not cols or None in cols:
+        return "constraint on no / unknown columns"
+    defs = [t.column(c) for c in cols]
+    for c, d in zip(cols, defs):
+        if (d["data_type"] or "").lower() in ("array", "json", "jsonb"):
+            return f"{c} is {d['data_type']}"
+        if c not in df.columns and (d["default"] is not None or d["identity"] or d["generated"]):
+            return f"{c} not in silver, filled by the database"
+    expr = re.sub(r"^CHECK\s*", "", chk["definition"].strip())
+    expr = re.sub(r"\s+(NOT VALID|NO INHERIT)\s*$", "", expr)
+    values = [[_as_text(v, d) for v in df[c]] if c in df.columns else [None] * len(df)
+              for c, d in zip(cols, defs)]
+    combos = Counter(zip(*values))
+    uniq = list(combos)
+    args = ", ".join(f"CAST(:a{i} AS text[])" for i in range(len(cols)))
+    names = ", ".join(f"dhms_a{i}" for i in range(len(cols)))
+    casts = ", ".join(f'CAST(u.dhms_a{i} AS {d["type"]}) AS "{c}"' for i, (c, d) in enumerate(zip(cols, defs)))
+    sql = (f"SELECT dhms_n FROM (SELECT u.dhms_n, {casts} FROM unnest(CAST(:n AS int[]), {args}) "
+           f"AS u(dhms_n, {names})) v "
+           f"WHERE ({expr}) IS FALSE")
+    bad = []
+    conn.execute(text("SAVEPOINT dhms_check"))
+    try:
+        for s in range(0, len(uniq), KEY_CHUNK):
+            part = uniq[s:s + KEY_CHUNK]
+            params = {"n": list(range(s, s + len(part)))}
+            params.update({f"a{i}": [p[i] for p in part] for i in range(len(cols))})
+            bad += [uniq[r[0]] for r in conn.execute(text(sql), params)]
+        conn.execute(text("RELEASE SAVEPOINT dhms_check"))
+    except Exception as e:
+        conn.execute(text("ROLLBACK TO SAVEPOINT dhms_check"))
+        return f"could not evaluate ({type(e).__name__}: {str(e).splitlines()[0][:120]})"
+    rows = int(sum(combos[b] for b in bad))
+    ex = [", ".join(f"{c}={v}" for c, v in zip(cols, b)) for b in bad[:MAX_EXAMPLES]]
+    return rows, ex
 
 
 def missing_parents(conn: Connection, t: TableDef, fk: dict, df: pd.DataFrame, pending: dict, mode: str):
@@ -335,6 +393,15 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
     if not (db_checks and conn is not None):
         return cols, issues
     fq = f'"{t.schema}"."{t.table}"'
+
+    # CHECK constraints: the database evaluates each rule on the silver values (read only)
+    for chk in t.checks:
+        res = check_violations(conn, t, chk, df)
+        if isinstance(res, str):
+            issue("INFO", ", ".join(c for c in chk["columns"] if c), f"check {chk['name']} not tested: {res}")
+        elif res[0]:
+            issue("BLOCKER", ", ".join(chk["columns"]), f"check {chk['name']} fails: {chk['definition']}",
+                  res[0], res[1])
 
     # foreign keys: silver values that the referenced table does not have
     for fk in t.foreign_keys:
