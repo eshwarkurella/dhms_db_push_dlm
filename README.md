@@ -42,6 +42,8 @@ DL tables (`master_line_dl`, `child_line_dl`, `master_point`) are not included y
    (`KEEP_SILVER_VALUE` in config.py).
    **Row filter** (`ROW_FILTERS` in config.py): the 10m tables keep only `threshold_name = 'As per CA'`
    (no case / spaces); the dropped rows are counted in the report. Column missing in silver → BLOCKER.
+   **Missing parent** (`BLANK_MISSING_PARENT`): `master_rutting_child_10m.parent_id` is set to NULL when the
+   rutting parent has no row for it (the parent only holds sections with a defect) → WARNING with the count.
 3. **Checks** every table: BLOCKER (the insert would fail) / WARNING (it would insert, but not as expected) / INFO.
 4. **Pushes, only with `--apply` and no BLOCKER**, in **one transaction for all tables**:
    - `--mode replace` (default): delete this survey's rows in each table (children first), then insert (parents

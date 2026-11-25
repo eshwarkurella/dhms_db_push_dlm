@@ -135,6 +135,54 @@ def _key(v):
     return v
 
 
+def missing_parents(conn: Connection, t: TableDef, fk: dict, df: pd.DataFrame, pending: dict, mode: str):
+    """Values of a one-column foreign key in df that the parent will NOT hold at insert time.
+    The parent at insert time = its database rows (minus this survey's rows that replace deletes, when the
+    parent is part of this push) + its silver rows when it is pushed before this table (pending).
+    Returns (missing values sorted, number of df rows holding one, description of where it was looked up)."""
+    col, ref = fk["columns"][0], fk["ref_columns"][0]
+    vals = sorted({_key(v) for v in df[col] if not _is_null(v)}, key=str)
+    parent = (pending or {}).get(fk["ref_table"]) if fk["ref_schema"] == t.schema else None
+    drop, drop_params = "", {}
+    if parent is not None and mode == "replace" and parent[1] is not None:
+        drop, drop_params = f" AND NOT ({parent[1][0]})", parent[1][1]
+    found = set()
+    if parent is not None and ref in parent[0].columns:
+        found |= {str(_key(v)) for v in parent[0][ref] if not _is_null(v)}
+    for i in range(0, len(vals), KEY_CHUNK):
+        part = vals[i:i + KEY_CHUNK]
+        found |= {str(_key(r[0])) for r in conn.execute(text(
+            f'SELECT DISTINCT "{ref}" FROM "{fk["ref_schema"]}"."{fk["ref_table"]}" '
+            f'WHERE "{ref}"::text = ANY(:v){drop}'), {**drop_params, "v": [str(x) for x in part]})}
+    miss = [v for v in vals if str(v) not in found]
+    miss_s = {str(v) for v in miss}
+    rows = int(df[col].map(lambda v: not _is_null(v) and str(_key(v)) in miss_s).sum()) if miss else 0
+    where = (f"{fk['ref_table']}.{ref} (database" +
+             (", after replace deletes this survey's rows" if drop else "") +
+             (", nor in its silver file pushed before this table)" if parent is not None else ")"))
+    return miss, rows, where
+
+
+def blank_missing_parents(conn: Connection, t: TableDef, df: pd.DataFrame, column: str, pending: dict,
+                          mode: str):
+    """Sets `column` to NULL on the rows whose parent (via the table's one-column foreign key on it) will not
+    exist at insert time. Returns (frame, issue dicts without the table name)."""
+    fk = next((f for f in t.foreign_keys if f["columns"] == [column]), None)
+    if fk is None or column not in df.columns:
+        return df, [{"severity": "WARNING", "column": column,
+                     "issue": f"blank missing parent: no foreign key on {column} or column not in silver → skipped"}]
+    miss, rows, where = missing_parents(conn, t, fk, df, pending, mode)
+    if not miss:
+        return df, []
+    miss_s = {str(v) for v in miss}
+    df = df.copy()
+    df[column] = df[column].astype(object)
+    df.loc[df[column].map(lambda v: not _is_null(v) and str(_key(v)) in miss_s), column] = None
+    return df, [{"severity": "WARNING", "column": column, "rows": rows,
+                 "issue": f"{column} set to NULL: parent not in {where} ({len(miss)} parent ids)",
+                 "examples": "; ".join(_short(x) for x in miss[:MAX_EXAMPLES])}]
+
+
 def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_checks: bool = True,
             scope=None, mode: str = "replace", pending=None):
     """Returns (column rows, issue rows). Issue severity: BLOCKER = the insert would fail;
@@ -295,27 +343,8 @@ def compare(t: TableDef, df: pd.DataFrame | None, conn: Connection | None, db_ch
                 issue("INFO", ", ".join(fk["columns"]), f"multi-column foreign key {fk['name']} not checked")
             continue
         col, ref = fk["columns"][0], fk["ref_columns"][0]
-        vals = sorted({_key(v) for v in df[col] if not _is_null(v)}, key=str)
-        # the parent as it will be at insert time: database rows (minus what replace deletes) + its silver rows
-        parent = pending.get(fk["ref_table"]) if fk["ref_schema"] == t.schema else None
-        drop, drop_params = "", {}
-        if parent is not None and mode == "replace" and parent[1] is not None:
-            drop, drop_params = f" AND NOT ({parent[1][0]})", parent[1][1]
-        found = set()
-        if parent is not None and ref in parent[0].columns:
-            found |= {str(_key(v)) for v in parent[0][ref] if not _is_null(v)}
-        for i in range(0, len(vals), KEY_CHUNK):
-            part = vals[i:i + KEY_CHUNK]
-            found |= {str(_key(r[0])) for r in conn.execute(text(
-                f'SELECT DISTINCT "{ref}" FROM "{fk["ref_schema"]}"."{fk["ref_table"]}" '
-                f'WHERE "{ref}"::text = ANY(:v){drop}'), {**drop_params, "v": [str(x) for x in part]})}
-        miss = [v for v in vals if str(v) not in found]
+        miss, rows, where = missing_parents(conn, t, fk, df, pending, mode)
         if miss:
-            miss_s = {str(v) for v in miss}
-            rows = int(df[col].map(lambda v: not _is_null(v) and str(_key(v)) in miss_s).sum())
-            where = (f"{fk['ref_table']}.{ref} (database" +
-                     (", after replace deletes this survey's rows" if drop else "") +
-                     (", nor in its silver file pushed before this table)" if parent is not None else ")"))
             issue("BLOCKER", col, f"foreign key {fk['name']}: value not in {where}", rows, miss[:MAX_EXAMPLES])
 
     # rows of this survey already in the table, and primary keys that would collide

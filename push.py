@@ -33,7 +33,7 @@ from psycopg2.extras import execute_values
 from sqlalchemy import text
 
 from dhms_push import config
-from dhms_push.compare import compare
+from dhms_push.compare import blank_missing_parents, compare
 from dhms_push.prepare import rows_for_insert
 from dhms_push.project_ids import apply_ids, lookup_ids
 from dhms_push.schema import create_table_sql, read_table_def
@@ -108,10 +108,13 @@ def main() -> int:
                 f.write(create_table_sql(t))
             df = frames[table]
             filled = []
+            scope = scope_sql(table, [c["name"] for c in t.columns], survey) if t.exists else None
             if df is not None and t.exists:
                 df, filled = apply_ids(table, df, [c["name"] for c in t.columns], ids["ids"])
+                if table in config.BLANK_MISSING_PARENT:
+                    df, bi = blank_missing_parents(conn, t, df, config.BLANK_MISSING_PARENT[table], pending, a.mode)
+                    filter_issues += [{"table": table, **i} for i in bi]
                 prepared[table] = df
-            scope = scope_sql(table, [c["name"] for c in t.columns], survey) if t.exists else None
             cols, issues = compare(t, df, conn, scope=scope, mode=a.mode, pending=pending)
             issues = [i for i in filter_issues if i["table"] == table] + issues
             if table in prepared:

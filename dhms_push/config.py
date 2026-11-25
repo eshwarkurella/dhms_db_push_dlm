@@ -70,6 +70,13 @@ ROW_FILTERS = {
     "master_ravelling_10m": _AS_PER_CA,
 }
 
+# ── Child rows whose parent does not exist: {database table: foreign key column}. The parent only has the
+#    sections with a defect, the 10m child covers the whole road → the column is set to NULL on those rows
+#    (counted in the report) instead of blocking the push. A NOT NULL column then still gives a BLOCKER.
+BLANK_MISSING_PARENT = {
+    "master_rutting_child_10m": "parent_id",
+}
+
 # Silver writes some text columns as lists (e.g. image_urls); into a text column they go joined with this.
 LIST_SEPARATOR = ", "
 INSERT_PAGE_SIZE = 1000
