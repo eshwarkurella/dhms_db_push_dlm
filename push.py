@@ -37,7 +37,7 @@ from dhms_push.compare import compare
 from dhms_push.prepare import rows_for_insert
 from dhms_push.project_ids import apply_ids, lookup_ids
 from dhms_push.schema import create_table_sql, read_table_def
-from dhms_push.silver import read_silver, silver_folder
+from dhms_push.silver import filter_rows, read_silver, silver_folder
 from dhms_push.survey import scope_note, scope_sql, survey_of
 
 
@@ -61,9 +61,12 @@ def main() -> int:
         return 2
 
     folder = silver_folder(a.silver)
-    frames, paths = {}, {}
+    frames, paths, filter_issues = {}, {}, []
     for table, name, _ in targets:
         frames[table], paths[table] = read_silver(folder, name)
+        if frames[table] is not None and table in config.ROW_FILTERS:
+            frames[table], fi = filter_rows(frames[table], config.ROW_FILTERS[table])
+            filter_issues += [{"table": table, **i} for i in fi]
     if not any(df is not None for df in frames.values()):
         print(f"No silver files found in {folder}")
         return 2
@@ -110,6 +113,7 @@ def main() -> int:
                 prepared[table] = df
             scope = scope_sql(table, [c["name"] for c in t.columns], survey) if t.exists else None
             cols, issues = compare(t, df, conn, scope=scope, mode=a.mode, pending=pending)
+            issues = [i for i in filter_issues if i["table"] == table] + issues
             if table in prepared:
                 pending[table] = (prepared[table], scope)
             all_cols += cols

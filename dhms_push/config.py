@@ -59,6 +59,17 @@ SURVEY_COLUMNS = ["phase", "cycle"]
 # geometry_child.parent_id = '<UPC>_geometry_parent' (geometry is per road, not per phase / cycle).
 SCOPE_BY_COLUMN = {"geometry_child": ("parent_id", "{upc}_geometry_parent")}
 
+# ── Rows kept from a silver file before anything else: {database table: {silver column: value kept}}.
+#    Compared without case / surrounding spaces. The other rows are dropped (counted in the report).
+#    A table whose silver file lacks the column is a BLOCKER (nothing would be filtered).
+_AS_PER_CA = {"threshold_name": "As per CA"}
+ROW_FILTERS = {
+    "master_roughness_child_10m": _AS_PER_CA,
+    "master_rutting_child_10m": _AS_PER_CA,
+    "master_cracking_child_10m": _AS_PER_CA,
+    "master_ravelling_10m": _AS_PER_CA,
+}
+
 # Silver writes some text columns as lists (e.g. image_urls); into a text column they go joined with this.
 LIST_SEPARATOR = ", "
 INSERT_PAGE_SIZE = 1000

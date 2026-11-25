@@ -29,6 +29,26 @@ def silver_folder(path: str) -> str:
     return sub if os.path.isdir(sub) else path
 
 
+def filter_rows(df: pd.DataFrame, rules: dict) -> tuple[pd.DataFrame, list]:
+    """Keeps the rows whose columns match rules {column: value} (no case / surrounding spaces).
+       Returns (filtered frame, issue dicts without the table name)."""
+    issues = []
+    for col, value in rules.items():
+        if col not in df.columns:
+            issues.append({"severity": "BLOCKER", "column": col,
+                           "issue": f"row filter {col} = '{value}': column not in silver, rows not filtered"})
+            continue
+        keep = df[col].astype("string").str.strip().str.lower() == str(value).strip().lower()
+        keep = keep.fillna(False).astype(bool)
+        dropped = int((~keep).sum())
+        others = df.loc[~keep, col].astype("string").fillna("<NULL>").value_counts().head(5)
+        issues.append({"severity": "INFO", "column": col, "rows": dropped,
+                       "issue": f"row filter {col} = '{value}': kept {int(keep.sum()):,} of {len(df):,} rows",
+                       "examples": "; ".join(f"{v} ({n:,})" for v, n in others.items())})
+        df = df[keep].reset_index(drop=True)
+    return df, issues
+
+
 def read_silver(folder: str, name: str) -> tuple[pd.DataFrame | None, str]:
     """(DataFrame or None, path tried). Parquet preferred, csv if there is no parquet."""
     for ext in ("parquet", "csv"):
